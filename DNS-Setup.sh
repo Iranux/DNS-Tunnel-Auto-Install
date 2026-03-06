@@ -670,6 +670,10 @@ SSH_USER=""
 SSH_PASS=""
 TUNNELS_CHANGED=false
 SSH_SETUP_DONE=false
+CF_API_TOKEN=""
+CF_ZONE_ID=""
+CF_AUTO_DNS=false
+NS_NAME=""
 
 # ─── STEP 1: Pre-flight Checks ─────────────────────────────────────────────────
 
@@ -759,41 +763,186 @@ step_ask_domain() {
     print_ok "Using domain: ${BOLD}${DOMAIN}${NC}"
 }
 
+# ─── Cloudflare API Helpers ────────────────────────────────────────────────────
+
+generate_ns_name() {
+    local suffix
+    suffix=$(tr -dc 'a-z0-9' < /dev/urandom | head -c 4)
+    echo "ns-${suffix}"
+}
+
+cf_get_zone_id() {
+    local domain="$1"
+    local token="$2"
+    local response zone_id
+    response=$(curl -s --max-time 15 \
+        -H "Authorization: Bearer ${token}" \
+        -H "Content-Type: application/json" \
+        "https://api.cloudflare.com/client/v4/zones?name=${domain}" 2>/dev/null || true)
+    if ! echo "$response" | grep -q '"success":true'; then
+        echo ""
+        return 1
+    fi
+    zone_id=$(echo "$response" | grep -o '"id":"[a-f0-9]\+' | head -1 | sed 's/"id":"//')
+    echo "$zone_id"
+}
+
+cf_record_exists() {
+    local zone_id="$1"
+    local token="$2"
+    local record_type="$3"
+    local record_name="$4"
+    local response
+    response=$(curl -s --max-time 15 \
+        -H "Authorization: Bearer ${token}" \
+        -H "Content-Type: application/json" \
+        "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records?type=${record_type}&name=${record_name}" 2>/dev/null || true)
+    if echo "$response" | grep -q '"success":true'; then
+        if echo "$response" | grep -q '"id":"[a-f0-9]'; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+cf_create_dns_records() {
+    local domain="$1"
+    local server_ip="$2"
+    local ns_name="$3"
+    local a_record_name="${ns_name}.${domain}"
+    local ns_value="${ns_name}.${domain}"
+    local response err_msg sub
+
+    print_info "Creating DNS records for ${BOLD}${domain}${NC} via Cloudflare API..."
+    echo ""
+
+    # Create A record
+    if cf_record_exists "$CF_ZONE_ID" "$CF_API_TOKEN" "A" "$a_record_name"; then
+        print_ok "A record already exists: ${a_record_name} -> ${server_ip}"
+    else
+        response=$(curl -s --max-time 15 \
+            -X POST \
+            -H "Authorization: Bearer ${CF_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data "{\"type\":\"A\",\"name\":\"${a_record_name}\",\"content\":\"${server_ip}\",\"ttl\":1,\"proxied\":false}" \
+            "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records" 2>/dev/null || true)
+        if echo "$response" | grep -q '"success":true'; then
+            print_ok "Created A record: ${a_record_name} -> ${server_ip} (DNS Only)"
+        else
+            err_msg=$(echo "$response" | grep -o '"message":"[^"]*"' | head -1 | sed 's/"message":"//;s/"//')
+            print_fail "Failed to create A record: ${err_msg:-unknown error}"
+            return 1
+        fi
+    fi
+
+    # Create NS records for all four subdomains
+    for sub in t2 d2 s2 ds2; do
+        local ns_rec_name="${sub}.${domain}"
+        if cf_record_exists "$CF_ZONE_ID" "$CF_API_TOKEN" "NS" "$ns_rec_name"; then
+            print_ok "NS record already exists: ${ns_rec_name} -> ${ns_value}"
+        else
+            response=$(curl -s --max-time 15 \
+                -X POST \
+                -H "Authorization: Bearer ${CF_API_TOKEN}" \
+                -H "Content-Type: application/json" \
+                --data "{\"type\":\"NS\",\"name\":\"${ns_rec_name}\",\"content\":\"${ns_value}\",\"ttl\":1}" \
+                "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records" 2>/dev/null || true)
+            if echo "$response" | grep -q '"success":true'; then
+                print_ok "Created NS record: ${ns_rec_name} -> ${ns_value}"
+            else
+                err_msg=$(echo "$response" | grep -o '"message":"[^"]*"' | head -1 | sed 's/"message":"//;s/"//')
+                print_warn "Failed to create NS record for ${sub}: ${err_msg:-unknown error}"
+            fi
+        fi
+    done
+
+    echo ""
+    print_ok "DNS records setup complete"
+}
+
+step_cloudflare_setup() {
+    echo ""
+    if prompt_yn "Auto-create DNS records via Cloudflare API?" "y"; then
+        CF_AUTO_DNS=true
+
+        echo ""
+        print_info "Enter your Cloudflare API Token (requires Zone:DNS:Edit permission)"
+        echo -ne "  ${BOLD}API Token${NC} ${DIM}(input hidden)${NC}: "
+        read -rs CF_API_TOKEN
+        echo ""
+
+        if [[ -z "$CF_API_TOKEN" ]]; then
+            print_fail "API Token cannot be empty. Falling back to manual DNS setup."
+            CF_AUTO_DNS=false
+            return
+        fi
+
+        # Auto-detect Zone ID for this domain
+        print_info "Detecting Zone ID for ${BOLD}${DOMAIN}${NC}..."
+        CF_ZONE_ID=$(cf_get_zone_id "$DOMAIN" "$CF_API_TOKEN" || true)
+
+        if [[ -z "$CF_ZONE_ID" ]]; then
+            print_warn "Could not auto-detect Zone ID for ${DOMAIN}."
+            CF_ZONE_ID=$(prompt_input "Enter Cloudflare Zone ID manually")
+        fi
+
+        if [[ -z "$CF_ZONE_ID" ]]; then
+            print_fail "Zone ID is required. Falling back to manual DNS setup."
+            CF_AUTO_DNS=false
+            CF_API_TOKEN=""
+            return
+        fi
+
+        print_ok "Zone ID: ${CF_ZONE_ID}"
+    else
+        CF_AUTO_DNS=false
+    fi
+}
+
 # ─── STEP 3: Show DNS Records ──────────────────────────────────────────────────
 
 step_dns_records() {
     print_step 3 "DNS Records (Cloudflare)"
 
-    print_info "Create these DNS records in your Cloudflare dashboard:"
-    echo ""
-    print_box \
-        "Record 1:  Type: A   | Name: ns | Value: ${SERVER_IP}" \
-        "           Proxy: OFF (DNS Only - grey cloud)" \
-        "" \
-        "Record 2:  Type: NS  | Name: t2  | Value: ns.${DOMAIN}" \
-        "Record 3:  Type: NS  | Name: d2  | Value: ns.${DOMAIN}" \
-        "Record 4:  Type: NS  | Name: s2  | Value: ns.${DOMAIN}" \
-        "Record 5:  Type: NS  | Name: ds2 | Value: ns.${DOMAIN}"
+    # Generate a unique NS hostname for this domain
+    NS_NAME=$(generate_ns_name)
 
-    echo ""
-    print_warn "IMPORTANT: The A record MUST be DNS Only (grey cloud, NOT orange)"
-    print_warn "IMPORTANT: The A record name must be \"ns\" (not \"tns\")"
-    echo ""
-    echo "  Subdomain purposes:"
-    echo "    t2  = Slipstream + SOCKS tunnel"
-    echo "    d2  = DNSTT + SOCKS tunnel"
-    echo "    s2  = Slipstream + SSH tunnel"
-    echo "    ds2 = DNSTT + SSH tunnel"
-    echo ""
+    step_cloudflare_setup
 
-    if ! prompt_yn "Have you created these DNS records in Cloudflare?" "n"; then
+    if [[ "$CF_AUTO_DNS" == true ]]; then
+        cf_create_dns_records "$DOMAIN" "$SERVER_IP" "$NS_NAME"
+    else
+        print_info "Create these DNS records in your Cloudflare dashboard:"
         echo ""
-        print_info "Please create the DNS records and re-run this script."
-        exit 0
-    fi
+        print_box \
+            "Record 1:  Type: A   | Name: ${NS_NAME} | Value: ${SERVER_IP}" \
+            "           Proxy: OFF (DNS Only - grey cloud)" \
+            "" \
+            "Record 2:  Type: NS  | Name: t2  | Value: ${NS_NAME}.${DOMAIN}" \
+            "Record 3:  Type: NS  | Name: d2  | Value: ${NS_NAME}.${DOMAIN}" \
+            "Record 4:  Type: NS  | Name: s2  | Value: ${NS_NAME}.${DOMAIN}" \
+            "Record 5:  Type: NS  | Name: ds2 | Value: ${NS_NAME}.${DOMAIN}"
 
-    echo ""
-    print_ok "DNS records confirmed"
+        echo ""
+        print_warn "IMPORTANT: The A record MUST be DNS Only (grey cloud, NOT orange)"
+        print_warn "IMPORTANT: Use the exact A record name shown above: \"${NS_NAME}\""
+        echo ""
+        echo "  Subdomain purposes:"
+        echo "    t2  = Slipstream + SOCKS tunnel"
+        echo "    d2  = DNSTT + SOCKS tunnel"
+        echo "    s2  = Slipstream + SSH tunnel"
+        echo "    ds2 = DNSTT + SSH tunnel"
+        echo ""
+
+        if ! prompt_yn "Have you created these DNS records in Cloudflare?" "n"; then
+            echo ""
+            print_info "Please create the DNS records and re-run this script."
+            exit 0
+        fi
+
+        echo ""
+        print_ok "DNS records confirmed"
+    fi
 }
 
 # ─── STEP 4: Free Port 53 ──────────────────────────────────────────────────────
@@ -1657,28 +1806,37 @@ do_add_domain() {
     print_ok "Domain: ${DOMAIN}"
     echo ""
 
-    # DNS record instructions
+    # DNS record instructions / auto-create
     print_header "DNS Records for ${DOMAIN}"
 
-    print_info "Create these records in Cloudflare for ${BOLD}${DOMAIN}${NC}:"
-    echo ""
-    print_box \
-        "Record 1:  Type: A   | Name: ns  | Value: ${SERVER_IP}" \
-        "           Proxy: OFF (DNS Only - grey cloud)" \
-        "" \
-        "Record 2:  Type: NS  | Name: t2  | Value: ns.${DOMAIN}" \
-        "Record 3:  Type: NS  | Name: d2  | Value: ns.${DOMAIN}" \
-        "Record 4:  Type: NS  | Name: s2  | Value: ns.${DOMAIN}" \
-        "Record 5:  Type: NS  | Name: ds2 | Value: ns.${DOMAIN}"
+    # Generate a unique NS hostname for this domain
+    NS_NAME=$(generate_ns_name)
 
-    echo ""
-    print_warn "IMPORTANT: The A record MUST be DNS Only (grey cloud, NOT orange)"
-    echo ""
+    step_cloudflare_setup
 
-    if ! prompt_yn "Have you created these DNS records in Cloudflare?" "n"; then
+    if [[ "$CF_AUTO_DNS" == true ]]; then
+        cf_create_dns_records "$DOMAIN" "$SERVER_IP" "$NS_NAME"
+    else
+        print_info "Create these records in Cloudflare for ${BOLD}${DOMAIN}${NC}:"
         echo ""
-        print_info "Please create the DNS records and re-run: sudo bash $0 --add-domain"
-        exit 0
+        print_box \
+            "Record 1:  Type: A   | Name: ${NS_NAME}  | Value: ${SERVER_IP}" \
+            "           Proxy: OFF (DNS Only - grey cloud)" \
+            "" \
+            "Record 2:  Type: NS  | Name: t2  | Value: ${NS_NAME}.${DOMAIN}" \
+            "Record 3:  Type: NS  | Name: d2  | Value: ${NS_NAME}.${DOMAIN}" \
+            "Record 4:  Type: NS  | Name: s2  | Value: ${NS_NAME}.${DOMAIN}" \
+            "Record 5:  Type: NS  | Name: ds2 | Value: ${NS_NAME}.${DOMAIN}"
+
+        echo ""
+        print_warn "IMPORTANT: The A record MUST be DNS Only (grey cloud, NOT orange)"
+        echo ""
+
+        if ! prompt_yn "Have you created these DNS records in Cloudflare?" "n"; then
+            echo ""
+            print_info "Please create the DNS records and re-run: sudo bash $0 --add-domain"
+            exit 0
+        fi
     fi
 
     echo ""
